@@ -12,6 +12,7 @@ import pandas as pd
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
+from einops import rearrange
 
 from dataset import MetaLoader
 from models.vindlu import VindLU
@@ -34,21 +35,48 @@ class CustomModel(VindLU):
             config=config, tokenizer=tokenizer, is_pretrain=False
         )
 
-    def forward(self, image, text, num_texts=None):
+    def forward(self, image, text, num_texts):
         # ================= Dual Encoder ITC loss ================ #
         self.clip_contrastive_temperature()
 
         vision_embeds, pooled_vision_embeds = self.encode_vision(image)
         text_embeds, pooled_text_embeds = self.encode_text(text)
 
+        vision_proj = self.vision_proj(pooled_vision_embeds)
+        text_proj = self.text_proj(pooled_text_embeds)
+
         sim_v2t, sim_t2v = get_sim(  # sim_v2t: V, T
-            pooled_vision_embeds,
-            pooled_text_embeds,
+            vision_proj,
+            text_proj,
             temp=self.temp,
         )
 
-        # TODO: implement vtm in addition to vtc
-        return sim_v2t
+        vision_embeds = rearrange(vision_embeds, "b t l c -> b (t l) c")
+        multimodal_encoder = self.get_text_encoder()
+        batch_size = len(num_texts)
+        indx = list()
+        for i in range(batch_size):
+            indx.extend([i for j in range(num_texts[i])])
+        _vision_embeds = vision_embeds[indx]
+        _vision_att_mask = torch.ones(
+            _vision_embeds.size()[:-1],
+            dtype=torch.long,
+            device=_vision_embeds.device,
+        )
+
+        output = multimodal_encoder(
+            encoder_embeds=text_embeds,
+            attention_mask=text.attention_mask,
+            encoder_hidden_states=_vision_embeds,
+            encoder_attention_mask=_vision_att_mask,
+            return_dict=True,
+            mode="fusion",
+        )
+
+        vtm_embeds = output.last_hidden_state[:, 0]
+        vtm_logits = self.itm_head(vtm_embeds)
+        vtm_probs = vtm_logits.softmax(dim=-1)[:, 1]  # criterions.py -- L.155
+        return sim_v2t, vtm_probs
 
 
 def setup_model(
@@ -129,7 +157,8 @@ def main(config):
         find_unused_parameters=True,
     )
 
-    results = dict()
+    vtc_results = dict()
+    vtm_results = dict()
     for i, batch in enumerate(tqdm(loader)):
         video = batch['video'].to(device)
         text_input = tokenizer(
@@ -140,15 +169,24 @@ def main(config):
             return_tensors='pt',
         ).to(device)
         with torch.cuda.amp.autocast(enabled=config.fp16):
-            sim_i2t = model(video, text_input, batch['num_texts'])  # size: V, T
+            sim_i2t, vtm_probs = model(video, text_input, batch['num_texts'])
             sim_i2t = sim_i2t.to('cpu')
-        processed = post_process_sim(
+            vtm_probs = vtm_probs.to('cpu')
+        vtc_processed = post_process_sim(
             sim_i2t,
             batch['ids'],
             batch['num_texts'],
         )
-        for item_id, scores in processed:
-           results[item_id] = {'scores': scores}
+        for item_id, scores in vtc_processed:
+           vtc_results[item_id] = {'scores': scores}
+
+        vtm_processed = post_process_probs(
+            vtm_probs,
+            batch['ids'],
+            batch['num_texts'],
+        )
+        for item_id, scores in vtm_processed:
+            vtm_results[item_id] = {'scores': scores}
 
     ann_file = process_path(config.ann_file)
     name = osp.splitext(osp.split(ann_file)[-1])[0]
@@ -157,7 +195,10 @@ def main(config):
     vtc_file = osp.join(output_dir, f'{name}-vtc-{_task}.json')
     vtm_file = osp.join(output_dir, f'{name}-vtm-{_task}.json')
     with open(vtc_file, 'w') as f:
-        json.dump(results, f, sort_keys=False, indent=4)
+        json.dump(vtc_results, f, sort_keys=False, indent=4)
+
+    with open(vtm_file, 'w') as f:
+        json.dump(vtm_results, f, sort_keys=False, indent=4)
 
 
 def post_process_sim(sim_i2t, item_ids, num_texts):
@@ -168,6 +209,18 @@ def post_process_sim(sim_i2t, item_ids, num_texts):
     results = list()
     for i in range(num_videos):
         scores = sim_i2t[i, offset:offset+num_texts[i]].tolist()
+        results.append((item_ids[i], scores))
+        offset += num_texts[i]
+    return results
+
+
+def post_process_probs(vtm_scores, item_ids, num_texts):
+    num_videos = len(num_texts)
+    num_total_texts = sum(num_texts)
+    offset = 0
+    results = list()
+    for i in range(num_videos):
+        scores = vtm_scores[offset:offset+num_texts[i]].tolist()
         results.append((item_ids[i], scores))
         offset += num_texts[i]
     return results
