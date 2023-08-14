@@ -1,0 +1,6 @@
+name: vindlu
+channels:
+  - conda-forge
+  - soumith
+  - defaults
+prefix: /kuacc/users/ikesen16/.conda/envs/vindlu

@@ -41,3 +41,5 @@ Thumbs.db
 .vim-arsync
 scratch.norg
 sync_to_red.sh
+
+checkpoints/
