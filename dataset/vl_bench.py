@@ -108,14 +108,17 @@ class VLBenchDataset(ImageVideoBaseDataset):
             item['key'] = key
             self.anno_list.append(item)
 
-    # TODO: implement this
-    # -- I can check what I read using the `read_frames_decord` function.
     def load_and_transform_media_data_video(self, index):
         item = self.anno_list[index]
         dataset = item['dataset']
         video_file = item['video_file']
         video_path = None
-        if dataset == 'QUVA':
+        task = item.get('linguistic_phenomena', None)
+        if task == 'change-of-state' and dataset != 'something-something-v2':
+            video_dir = self.youtube_dir
+            item_id = item['key']
+            video_path = osp.join(video_dir, f'{item_id}.mp4')
+        elif dataset == 'QUVA':
             normalized = item.get('normalized')
             assert normalized
             video_dir = osp.join(self.quva_dir, 'normalized_videos')
